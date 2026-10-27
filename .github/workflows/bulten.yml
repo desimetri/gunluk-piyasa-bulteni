@@ -1,0 +1,31 @@
+name: Günlük Finans Bülteni Otomasyonu
+
+on:
+  schedule:
+    # Her gün UTC saatiyle 05:00'te çalışır (Türkiye saatiyle sabah 08:00)
+    - cron: '0 5 * * *'
+  workflow_dispatch: # İsterseniz butona basarak da manuel çalıştırabilirsiniz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Depoyu Kopyala (Checkout)
+      uses: actions/checkout@v3
+
+    - name: Python Ortamını Kur
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Gerekli Kütüphaneleri Yükle
+      run: |
+        pip install feedparser requests
+
+    - name: Bülten Kodunu Çalıştır
+      env:
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+      run: |
+        python main.py
