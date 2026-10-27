@@ -27,18 +27,11 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 TO_EMAIL = "muratuslu@gmail.com"
-
 TIMEZONE = ZoneInfo("Europe/Istanbul")
-
 GEMINI_MODEL = "gemini-3.8-flash"
 
-YOUTUBE_API_BASE = (
-    "https://www.googleapis.com/youtube/v3"
-)
-
-YAHOO_API_BASE = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/"
-)
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+YAHOO_API_BASE = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
 CHANNEL_HANDLES = [
     "@EMRAHLAFCI",
@@ -46,11 +39,12 @@ CHANNEL_HANDLES = [
     "@KanalFinans",
 ]
 
-# Yahoo Finance sembolleri.
-# Sağlayıcının verdiği fiyat ve zaman bilgisi ayrıca kontrol edilir.
+# Yahoo Finance'ta XAUUSD=X ve XAGUSD=X bazı çağrılarda 404
+# döndürdüğünden GC=F ve SI=F vadeli işlem sembolleri kullanılıyor.
+# Bu fiyatlar spot altın/gümüş fiyatı olarak etiketlenmez.
 MARKET_ASSETS = [
-    ("Ons Altın", "XAUUSD=X", "USD/ons", 2),
-    ("Ons Gümüş", "XAGUSD=X", "USD/ons", 3),
+    ("Altın Vadeli İşlem", "GC=F", "USD/ons", 2),
+    ("Gümüş Vadeli İşlem", "SI=F", "USD/ons", 3),
     ("Brent Petrol", "BZ=F", "USD/varil", 2),
     ("BIST 100", "XU100.IS", "puan", 2),
     ("Nasdaq Composite", "^IXIC", "puan", 2),
@@ -58,6 +52,9 @@ MARKET_ASSETS = [
     ("USD/TRY", "USDTRY=X", "TRY", 4),
     ("EUR/TRY", "EURTRY=X", "TRY", 4),
 ]
+
+REQUEST_TIMEOUT = 40
+GEMINI_TIMEOUT_SECONDS = 5400
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,28 +80,105 @@ def api_get(url, params=None):
                 "(compatible; DailyFinanceNewsletter/1.0)"
             )
         },
-        timeout=40,
+        timeout=REQUEST_TIMEOUT,
     )
-
     response.raise_for_status()
     return response.json()
 
 
 def fiyat_formatla(value, decimals=2):
     text = f"{value:,.{decimals}f}"
-    return (
-        text.replace(",", "#")
-        .replace(".", ",")
-        .replace("#", ".")
-    )
+    return text.replace(",", "#").replace(".", ",").replace("#", ".")
 
 
 def tarih_formatla(value):
     if not value:
         return "Bilinmiyor"
+    return value.astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M:%S (TSİ)")
 
-    return value.astimezone(TIMEZONE).strftime(
-        "%d.%m.%Y %H:%M:%S (TSİ)"
+
+def html_sayfa(body, title="Günlük Finans ve Piyasa Bülteni"):
+    """Verilen HTML içeriğini eksiksiz HTML belgesine dönüştürür."""
+    return (
+        "<!DOCTYPE html><html lang='tr'><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        f"<title>{html.escape(title)}</title>"
+        "</head><body style='font-family:Arial,sans-serif;color:#202124;'>"
+        f"{body}</body></html>"
+    )
+
+
+def html_belgesini_duzenle(content):
+    """Gemini yanıtını, fiyat tablosu eklenebilecek bir HTML belgesine çevirir."""
+    content = (content or "").strip()
+    content = re.sub(
+        r"^\s*```(?:html)?\s*", "", content, flags=re.IGNORECASE
+    )
+    content = re.sub(r"\s*```\s*$", "", content).strip()
+
+    if not content:
+        raise RuntimeError("HTML içeriği boş.")
+
+    if "<html" not in content.lower():
+        content = html_sayfa(content)
+
+    if "<body" not in content.lower():
+        body_tag = re.search(r"<html\b[^>]*>", content, flags=re.IGNORECASE)
+        if body_tag:
+            head_end = re.search(r"</head\s*>", content, flags=re.IGNORECASE)
+            if head_end:
+                body_open = "<body style='font-family:Arial,sans-serif;color:#202124;'>"
+                html_close = re.search(r"</html\s*>", content, flags=re.IGNORECASE)
+                if html_close:
+                    before_close = content[:html_close.start()]
+                    after_close = content[html_close.start():]
+                    content = (
+                        before_close[:head_end.end()]
+                        + body_open
+                        + before_close[head_end.end():]
+                        + "</body>"
+                        + after_close
+                    )
+                else:
+                    content = content[:head_end.end()] + body_open + content[head_end.end():] + "</body>"
+            else:
+                content = (
+                    content[:body_tag.end()]
+                    + "<head><meta charset='UTF-8'></head>"
+                    + "<body style='font-family:Arial,sans-serif;color:#202124;'>"
+                    + content[body_tag.end():]
+                    + "</body>"
+                )
+        else:
+            content = html_sayfa(content)
+
+    if len(content) < 300:
+        raise RuntimeError("Üretilen HTML beklenenden kısa.")
+    return content
+
+
+def gemini_hata_mesaji(error):
+    """E-postada kullanıcıya gösterilecek kısa ve güvenli hata açıklaması."""
+    message = str(error).lower()
+    if any(token in message for token in (
+        "resource_exhausted", "quota", "rate limit", "429",
+        "requests per day", "limit exceeded",
+    )):
+        return (
+            "Gemini API kullanım kotası dolduğu için otomatik video ve haber "
+            "analizi bu çalıştırmada tamamlanamadı. Kota yenilendiğinde "
+            "sonraki zamanlanmış çalıştırma yeniden deneyebilir."
+        )
+    if any(token in message for token in ("503", "unavailable", "high demand")):
+        return (
+            "Gemini hizmeti geçici olarak kullanılamadığı için otomatik analiz "
+            "tamamlanamadı. Sonraki zamanlanmış çalıştırma yeniden deneyebilir."
+        )
+    return (
+        "Gemini üzerinden otomatik analiz bu çalıştırmada tamamlanamadı. "
+        "Aşağıda yalnızca doğrudan veri kaynağından alınabilen piyasa verileri "
+        "ve bulunan video bağlantıları sunulmuştur."
     )
 
 
@@ -114,44 +188,24 @@ def tarih_formatla(value):
 
 def son_videolari_getir():
     if not YOUTUBE_API_KEY:
-        raise RuntimeError(
-            "YOUTUBE_API_KEY bulunamadı. "
-            "GitHub Secrets ayarını kontrol et."
-        )
+        raise RuntimeError("YOUTUBE_API_KEY bulunamadı. GitHub Secrets ayarını kontrol et.")
 
     videolar = []
 
     for handle in CHANNEL_HANDLES:
-
-        logging.info(
-            "YouTube kanalı aranıyor: %s",
-            handle,
-        )
-
+        logging.info("YouTube kanalı aranıyor: %s", handle)
         channel_data = api_get(
             f"{YOUTUBE_API_BASE}/channels",
-            {
-                "part": "id,snippet,contentDetails",
-                "forHandle": handle,
-                "key": YOUTUBE_API_KEY,
-            },
+            {"part": "id,snippet,contentDetails", "forHandle": handle, "key": YOUTUBE_API_KEY},
         )
 
         channels = channel_data.get("items", [])
-
         if not channels:
-            raise RuntimeError(
-                f"YouTube kanalı bulunamadı: {handle}"
-            )
+            raise RuntimeError(f"YouTube kanalı bulunamadı: {handle}")
 
         channel = channels[0]
-
-        channel_name = channel["snippet"]["title"]
-
-        uploads_playlist = (
-            channel["contentDetails"]
-            ["relatedPlaylists"]["uploads"]
-        )
+        channel_name = channel["snippet"].get("title", handle)
+        uploads_playlist = channel["contentDetails"]["relatedPlaylists"]["uploads"]
 
         playlist_data = api_get(
             f"{YOUTUBE_API_BASE}/playlistItems",
@@ -163,30 +217,19 @@ def son_videolari_getir():
             },
         )
 
-        items = playlist_data.get("items", [])
-
         channel_videos = []
-
-        for item in items:
-
+        for item in playlist_data.get("items", []):
             snippet = item.get("snippet", {})
             details = item.get("contentDetails", {})
-
             video_id = (
                 details.get("videoId")
                 or snippet.get("resourceId", {}).get("videoId")
             )
-
             if not video_id:
                 continue
 
-            title = snippet.get("title", "")
-
-            # Kullanılamayan veya silinmiş videoları atla.
-            if title.lower() in (
-                "private video",
-                "deleted video",
-            ):
+            title = snippet.get("title", "").strip()
+            if title.lower() in ("private video", "deleted video"):
                 continue
 
             published_at = (
@@ -198,21 +241,12 @@ def son_videolari_getir():
             channel_videos.append({
                 "channel": channel_name,
                 "handle": handle,
-                "title": title,
+                "title": title or "Başlıksız video",
                 "published_at": published_at,
-                "url": (
-                    "https://www.youtube.com/watch?v="
-                    + video_id
-                ),
+                "url": f"https://www.youtube.com/watch?v={video_id}",
             })
 
-        # YouTube yükleme listesi normalde en yeniden eskiye
-        # sıralanır. Yine de tarih bilgisi varsa sıralamayı yap.
-        channel_videos.sort(
-            key=lambda video: video["published_at"],
-            reverse=True,
-        )
-
+        channel_videos.sort(key=lambda video: video["published_at"], reverse=True)
         channel_videos = channel_videos[:3]
 
         if len(channel_videos) != 3:
@@ -222,474 +256,280 @@ def son_videolari_getir():
             )
 
         videolar.extend(channel_videos)
-
-        logging.info(
-            "%s: %s video bulundu.",
-            channel_name,
-            len(channel_videos),
-        )
+        logging.info("%s: %s video bulundu.", channel_name, len(channel_videos))
 
     if len(videolar) != 9:
-        raise RuntimeError(
-            "Toplam 9 video bulunamadı. "
-            "Eksik verilerle bülten oluşturulmayacak."
-        )
+        raise RuntimeError("Toplam 9 video bulunamadı.")
 
     for index, video in enumerate(videolar, start=1):
         logging.info(
             "VİDEO %s | %s | %s | %s",
-            index,
-            video["channel"],
-            video["title"],
-            video["url"],
+            index, video["channel"], video["title"], video["url"]
         )
-
     return videolar
 
 
 # ============================================================
-# 2. HER YOUTUBE VİDEOSUNU GEMINI İLE AYRI AYRI ANALİZ ET
+# 2. GEMINI İLE VİDEOLARI TOPLU ANALİZ ET VE BÜLTENİ OLUŞTUR
 # ============================================================
 
-
-def interaction_sonucunu_bekle(
-    client,
-    interaction,
-    timeout_seconds=1800,
-):
+def interaction_sonucunu_bekle(client, interaction, timeout_seconds=GEMINI_TIMEOUT_SECONDS):
     start = time.monotonic()
+    transient_poll_errors = 0
 
-    while str(
-        getattr(interaction, "status", "")
-    ).lower() == "in_progress":
+    while True:
+        raw_status = getattr(interaction, "status", "")
+        status = str(raw_status).lower().split(".")[-1]
+
+        if status not in ("in_progress", "pending", "running", "queued"):
+            break
 
         if time.monotonic() - start > timeout_seconds:
-            raise TimeoutError(
-                "Gemini işlemi zaman aşımına uğradı."
-            )
+            raise TimeoutError("Gemini arka plan işlemi zaman aşımına uğradı.")
 
         time.sleep(5)
-
-        interaction = client.interactions.get(
-            interaction.id
-        )
-
-    status = str(
-        getattr(interaction, "status", "")
-    ).lower()
-
-    if status in ("failed", "cancelled", "incomplete"):
-        # API'nin döndürdüğü hata ayrıntılarını bulmaya çalış.
-        hata = getattr(interaction, "error", None)
-        eksik_bilgi = getattr(
-            interaction, "incomplete_details", None
-        )
-
-        # SDK nesnesinin tüm yanıtını da inceleme için kaydet.
         try:
-            if hasattr(interaction, "model_dump"):
-                ayrinti = interaction.model_dump(
-                    exclude_none=True
-                )
-            else:
-                ayrinti = repr(interaction)
-        except Exception as e:
-            ayrinti = f"Yanıt ayrıntıları okunamadı: {e!r}"
+            interaction = client.interactions.get(interaction.id)
+            transient_poll_errors = 0
+        except Exception as error:
+            transient_poll_errors += 1
+            logging.warning("Gemini işlem durumu sorgulanamadı (%s/3): %s", transient_poll_errors, error)
+            if transient_poll_errors >= 3:
+                raise
+            time.sleep(5)
 
-        logging.error("Gemini işlem durumu: %s", status)
-        logging.error("Gemini hata alanı: %r", hata)
-        logging.error(
-            "Gemini eksik işlem ayrıntıları: %r",
-            eksik_bilgi,
-        )
-        logging.error(
-            "Gemini API yanıt ayrıntıları: %r",
-            ayrinti,
-        )
+    raw_status = getattr(interaction, "status", "")
+    status = str(raw_status).lower().split(".")[-1]
 
-        raise RuntimeError(
-            f"Gemini işlemi tamamlanamadı. Durum: {status}. "
-            f"Hata: {hata!r}. Ayrıntılar GitHub Actions logunda."
-        )
+    if status not in ("completed", "succeeded", "success"):
+        try:
+            details = interaction.model_dump(exclude_none=True)
+        except Exception:
+            details = repr(interaction)
+        logging.error("Gemini işlemi tamamlanamadı. Durum=%s, ayrıntı=%r", status, details)
+        raise RuntimeError(f"Gemini işlemi tamamlanamadı. Durum: {status}. Ayrıntılar Actions logunda.")
 
     return interaction
 
 
+def piyasa_metni_olustur(piyasa_verileri):
+    lines = []
+    for item in piyasa_verileri:
+        if item["price"] is None:
+            lines.append(f"{item['name']}: VERİ ALINAMADI; sembol: {item['symbol']}.")
+            continue
 
-def videolari_analiz_et(videolar):
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
+        low = fiyat_formatla(item["low_5d"], item["decimals"]) if item["low_5d"] is not None else "Yok"
+        high = fiyat_formatla(item["high_5d"], item["decimals"]) if item["high_5d"] is not None else "Yok"
+        lines.append(
+            f"{item['name']} ({item['symbol']}): "
+            f"{fiyat_formatla(item['price'], item['decimals'])} {item['unit']}; "
+            f"son veri zamanı: {tarih_formatla(item['observed_at'])}; "
+            f"son 5 günlük mum düşük/yüksek: {low}/{high}; "
+            f"kaynak: {item['source_url']}"
+        )
+    return "\n".join(lines)
+
+
+def gemini_ile_guncel_bulten_uret(videolar, piyasa_verileri):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY bulunamadı.")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    now = istanbul_saati()
+    market_text = piyasa_metni_olustur(piyasa_verileri)
+
+    # Dokuz ayrı uygunluk ve analiz isteği yerine dokuz video tek istekte
+    # gönderilir. Gemini 3.8 Flash bir istekte birden çok YouTube videosunu
+    # işleyebilir; bu yöntem günlük API istek tüketimini ciddi biçimde azaltır.
+    video_inputs = [
+        {
+            "type": "video",
+            "uri": video["url"],
+            "processing": "agentic",
+        }
+        for video in videolar
+    ]
+
+    video_metadata = "\n".join(
+        f"{i}. Kanal: {v['channel']} | Başlık: {v['title']} | "
+        f"Yayın: {v['published_at']} | URL: {v['url']}"
+        for i, v in enumerate(videolar, start=1)
     )
 
-    analizler = []
-    max_deneme = 3
+    prompt = f"""
+Sen deneyimli bir finansal araştırma analisti ve HTML e-posta tasarımcısısın.
+Türkçe, dikkatli, kaynak odaklı ve yatırım tavsiyesi vermeyen bir günlük
+finans bülteni hazırla.
 
-    for index, video in enumerate(videolar, start=1):
-        logging.info(
-            "Video uygunluğu kontrol ediliyor (%s/%s): %s",
-            index,
-            len(videolar),
-            video["title"],
-        )
+RAPOR TARİHİ: {now.strftime('%d.%m.%Y %H:%M:%S')} Türkiye saati.
 
-        uygunluk_prompt = f"""
-Aşağıdaki YouTube videosunu yalnızca konu uygunluğu açısından
-sınıflandır.
+AŞAĞIDAKİ DOKUZ VİDEO GİRDİSİNİ TEK TEK İNCELE.
+Video başlıkları/kanalları/URL'leri:
+{video_metadata}
 
-KANAL: {video['channel']}
-BAŞLIK: {video['title']}
-YAYIN TARİHİ: {video['published_at']}
-URL: {video['url']}
+VİDEO İÇERİĞİNE DAİR KURALLAR:
+- Her videonun gerçek içeriğini incelemeye çalış; yalnızca başlıktan hareketle
+  konuşmacının söylemediği bir görüşü veya fiyat seviyesini ona atfetme.
+- Videonun finans ve ekonomiyle ilgisi yoksa ya da sponsorlu ürün tanıtımıysa
+  bunu açıkça “Analiz dışı” olarak işaretle ve finansal görüş çıkarmaya çalışma.
+- Videoya erişemiyorsan, içeriği doğrulayamıyorsan veya belirli bir ifadeyi
+  teyit edemiyorsan bunu açıkça belirt; içeriği izlemiş gibi davranma.
+- Analiz edilebilen her video için kanal, başlık, kısa ana tez, varlık/piyasa,
+  görüşün yönü, destek/direnç/hedef (yalnızca videoda gerçekten söylendiyse),
+  gerekçe, katalizör ve riskleri özetle.
+- Her sayısal hedefi mümkün olduğunda ilgili video başlığıyla ilişkilendir.
+  Fiyat seviyesi uydurma.
 
-Bu bültenin amacı finansal piyasalar ve ekonomi analizidir.
+DOĞRUDAN VERİ KAYNAĞINDAN ALINAN PİYASA VERİLERİ:
+{market_text}
 
-ANALİZE UYGUN:
-- Finansal piyasalar, yatırım, borsa, BIST, Nasdaq
-- Altın, gümüş, petrol, döviz, Bitcoin ve diğer finansal varlıklar
-- Merkez bankaları, faiz, enflasyon, makroekonomi
-- Ekonomik gelişmeler, şirket bilançoları ve piyasa haberleri
-- Finansal piyasaları etkileyebilecek jeopolitik gelişmeler
+PİYASA VERİLERİ KURALLARI:
+- Yukarıdaki fiyatlar Python tarafından Yahoo Finance'tan alınmıştır.
+  Bu sayılar dışında doğrulanmış anlık fiyat varmış gibi başka rakam yazma.
+- Son veri zamanının rapor saatinden eski olabileceğini belirt; kapanış veya
+  gecikmeli fiyatı anlık fiyat diye sunma.
+- Altın Vadeli İşlem (GC=F) ve Gümüş Vadeli İşlem (SI=F) vadeli işlem
+  göstergeleridir; spot fiyat diye adlandırma.
+- “Son 5 günlük mum düşük/yüksek” aralığını kesin destek/direnç kabul etme.
+- Veri alınamayan varlık için fiyat uydurma.
 
-ANALİZ DIŞI BIRAK:
-- Sponsorlu ürün tanıtımları ve reklam videoları
-- Telefon, teknoloji, otomobil veya başka ürün incelemeleri
-- Ürün kutu açılışı, alışveriş ve kişisel vlog içerikleri
-- Ekonomi veya finansal piyasalarla ilgisi olmayan içerikler
-- Yalnızca ürün tanıtımı içeren işbirliği videoları
+GÜNCEL GÜNDEM:
+Google Search aracını kullanarak rapor tarihine en yakın güvenilir kaynaklardan
+TCMB, faiz, enflasyon, fon/SPK, şirket bilançoları ve jeopolitik gelişmeleri
+araştır. En önemli 2-3 konuyu seç; tarihi, kaynağı ve olası piyasa etkisini
+belirt. Tarihi doğrulanamayan veya gelecek tarihli haberi olmuş gibi yazma.
+Kaynak bağlantılarını HTML'de tıklanabilir olarak ekle.
 
-Önemli:
-- Sadece başlığa bakarak kesin karar veremiyorsan ve içerik
-  belirsizse uygunluk durumunu UNCERTAIN olarak belirt.
-- Finansal piyasalar veya ekonomiyle anlamlı ilgisi olmayan
-  videoyu analiz dışı bırak.
-- Videonun içeriğini izlemiş gibi davranma.
-- Sadece aşağıdaki üç sonuçtan birini yaz:
-  ANALYZE
-  IGNORE
-  UNCERTAIN
-- Ardından tek satırlık kısa gerekçe yaz.
+BÜLTENDE ŞU BÖLÜMLER OLSUN:
+1. İki cümlelik strateji notu: kanalların gerçekten ortaklaştığı temalar,
+   konsensüs ve ana belirsizlikler. Görüşler farklıysa yapay konsensüs kurma.
+2. Emtialar: altın, gümüş ve Brent için kısa görünüm, katalizör, risk ve
+   gerekiyorsa yön rozeti. Kesin yön veya hedef için yeterli veri yoksa söyle.
+3. Majör piyasalar: BIST 100, Nasdaq Composite, Bitcoin, USD/TRY, EUR/TRY.
+   Görüşleri ve destek/dirençleri yalnızca kaynak varsa ver. Analitik çıkarımları
+   doğrudan video görüşlerinden ayır. USD/TRY veya EUR/TRY artışının TL'nin
+   ilgili para birimi karşısında değer kaybı anlamına geldiğini doğru açıkla.
+4. Güncel makro gündem: doğrulanmış 2-3 konu ve kaynak bağlantısı.
+5. Uzman sentezi: üç kanalın ortaklaştığı ve ayrıştığı noktalar; kısa/orta
+   vade farkları ve görüşlerin geçerli olabileceği koşullar.
+6. Riskler ve takip listesi: sadece doğrulanabilir takvim bilgileri ve koşullar.
+7. Video dökümü: dokuz videonun her birini “Analiz edildi”, “Analiz dışı” veya
+   “İçerik doğrulanamadı” olarak ayrı ayrı göster.
+8. Kaynaklar ve son bölümde “Bu içerik yatırım tavsiyesi değildir” uyarısı.
+
+HTML TASARIMI:
+- Yalnızca tam HTML dokümanı üret; Markdown veya ```html kullanma.
+- Türkçe, mobil uyumlu ve okunaklı e-posta tasarımı; inline CSS kullan.
+- JavaScript, uzak CSS veya uzak görsel kullanma.
+- Üretim tarihini/saatini en üstte göster.
+- Kaynak bağlantılarının görünür metni olsun.
+- Python'ın ayrıca ekleyeceği doğrudan fiyat tablosunu yeniden oluşturma;
+  herhangi bir fiyat tablosu oluşturma.
+- Finansal olgularla analitik yorumları birbirinden ayır.
+- Yanıtın ilk karakteri HTML dokümanına ait olsun; açıklama ekleme.
 """
 
-        uygunluk = None
-        uygunluk_hatasi = None
-
-        for deneme in range(1, max_deneme + 1):
-            try:
-                yanit = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=uygunluk_prompt,
-                )
-
-                uygunluk = (yanit.text or "").strip()
-                if uygunluk:
-                    uygunluk_hatasi = None
-                    break
-
-                raise RuntimeError(
-                    "Gemini uygunluk kontrolünde boş yanıt döndürdü."
-                )
-
-            except Exception as e:
-                uygunluk_hatasi = e
-                logging.warning(
-                    "Uygunluk kontrolü başarısız (%s/%s), "
-                    "video=%s, hata=%s",
-                    deneme,
-                    max_deneme,
-                    video["title"],
-                    e,
-                )
-
-                if deneme < max_deneme:
-                    time.sleep(10 * (2 ** (deneme - 1)))
-
-        if uygunluk_hatasi is not None or not uygunluk:
-            # Sınıflandırma yapılamıyorsa yanlış içerik üretme;
-            # videoyu analiz dışı bırakıp sebebini kaydet.
-            analizler.append({
-                "channel": video["channel"],
-                "title": video["title"],
-                "published_at": video["published_at"],
-                "url": video["url"],
-                "analysis": (
-                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
-                    "Konu uygunluğu belirlenemedi."
-                ),
-            })
-            logging.error(
-                "Uygunluk kontrolü tamamlanamadı; video atlandı: %s",
-                video["title"],
-            )
-            continue
-
-        karar = uygunluk.splitlines()[0].strip().upper()
-
-        if karar == "IGNORE":
-            logging.info(
-                "Video analiz dışı bırakıldı: %s | %s",
-                video["title"],
-                uygunluk,
-            )
-
-            analizler.append({
-                "channel": video["channel"],
-                "title": video["title"],
-                "published_at": video["published_at"],
-                "url": video["url"],
-                "analysis": (
-                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
-                    + uygunluk,
-                ),
-            })
-            # Tuple değil metin saklamak için alanı düzelt.
-            analizler[-1]["analysis"] = (
-                "VİDEO ANALİZ DIŞI BIRAKILDI: " + uygunluk
-            )
-            continue
-
-        if karar != "ANALYZE":
-            # Belirsiz içerikleri finansal analiz diye sunma.
-            logging.info(
-                "Video konusu belirsiz; analiz dışı bırakıldı: %s",
-                video["title"],
-            )
-            analizler.append({
-                "channel": video["channel"],
-                "title": video["title"],
-                "published_at": video["published_at"],
-                "url": video["url"],
-                "analysis": (
-                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
-                    "Ekonomi/piyasa ilgisi doğrulanamadı."
-                ),
-            })
-            continue
-
-        analiz = None
-        son_hata = None
-
-        for deneme in range(1, max_deneme + 1):
-            try:
-                analiz = video_analiz_et(
-                    client,
-                    video,
-                    index,
-                )
-                son_hata = None
-                break
-
-            except Exception as e:
-                son_hata = e
-                logging.exception(
-                    "Video analizi başarısız (%s/%s), "
-                    "video=%s",
-                    deneme,
-                    max_deneme,
-                    video["title"],
-                )
-
-                if deneme < max_deneme:
-                    time.sleep(10 * (2 ** (deneme - 1)))
-
-        if son_hata is not None or not analiz:
-            analiz = (
-                "VİDEO ANALİZ EDİLEMEDİ: "
-                f"Son hata: {son_hata}"
-            )
-            logging.error(
-                "Video tüm denemelerde başarısız; diğer videolara "
-                "geçiliyor: %s",
-                video["title"],
-            )
-
-        analizler.append({
-            "channel": video["channel"],
-            "title": video["title"],
-            "published_at": video["published_at"],
-            "url": video["url"],
-            "analysis": analiz,
-        })
-
-    basarili = sum(
-        1 for item in analizler
-        if not item["analysis"].startswith(
-            ("VİDEO ANALİZ EDİLEMEDİ", "VİDEO ANALİZ DIŞI BIRAKILDI")
-        )
+    # Bütün videolar ve nihai bülten bir istekte işlenir. Kota hataları tekrar
+    # tekrar çağrı yapılarak büyütülmez; hata halinde e-posta yedek raporla gider.
+    logging.info("Gemini dokuz videoyu ve güncel gündemi tek istekte analiz ediyor.")
+    interaction = client.interactions.create(
+        model=GEMINI_MODEL,
+        input=[{"type": "text", "text": prompt}] + video_inputs,
+        tools=[{"type": "google_search"}],
+        background=True,
     )
 
-    atlanan = sum(
-        1 for item in analizler
-        if item["analysis"].startswith("VİDEO ANALİZ DIŞI BIRAKILDI")
+    interaction = interaction_sonucunu_bekle(
+        client, interaction, timeout_seconds=GEMINI_TIMEOUT_SECONDS
     )
 
-    basarisiz = sum(
-        1 for item in analizler
-        if item["analysis"].startswith("VİDEO ANALİZ EDİLEMEDİ")
-    )
+    html_code = getattr(interaction, "output_text", None)
+    if not html_code or not html_code.strip():
+        raise RuntimeError("Gemini boş bülten döndürdü.")
 
-    logging.info(
-        "Video işlemleri tamamlandı. Analiz: %s, dışı bırakılan: %s, "
-        "başarısız: %s, toplam: %s",
-        basarili,
-        atlanan,
-        basarisiz,
-        len(analizler),
-    )
-
-    return analizler
+    html_code = html_belgesini_duzenle(html_code)
+    logging.info("Gemini HTML bülten hazır. Karakter sayısı: %s", len(html_code))
+    return html_code
 
 
 # ============================================================
 # 3. PİYASA VERİLERİNİ GEMINI'DAN BAĞIMSIZ AL
 # ============================================================
 
-def piyasa_verisini_getir(
-    name,
-    symbol,
-    unit,
-    decimals,
-):
-    url = YAHOO_API_BASE + quote(
-        symbol,
-        safe="",
-    )
-
-    data = api_get(
-        url,
-        {
-            "range": "1mo",
-            "interval": "1d",
-        },
-    )
+def piyasa_verisini_getir(name, symbol, unit, decimals):
+    url = YAHOO_API_BASE + quote(symbol, safe="")
+    data = api_get(url, {"range": "1mo", "interval": "1d"})
 
     chart = data.get("chart", {})
-
     if chart.get("error"):
-        raise RuntimeError(
-            f"Yahoo Finance hatası: {chart['error']}"
-        )
+        raise RuntimeError(f"Yahoo Finance hatası: {chart['error']}")
 
     results = chart.get("result") or []
-
     if not results:
-        raise RuntimeError(
-            f"{symbol} için piyasa verisi bulunamadı."
-        )
+        raise RuntimeError(f"{symbol} için piyasa verisi bulunamadı.")
 
     result = results[0]
     meta = result.get("meta", {})
-
     timestamps = result.get("timestamp") or []
-
-    indicators = result.get("indicators", {})
-    quote_data = (
-        indicators.get("quote") or [{}]
-    )[0]
-
+    quote_data = (result.get("indicators", {}).get("quote") or [{}])[0]
     closes = quote_data.get("close") or []
     highs = quote_data.get("high") or []
     lows = quote_data.get("low") or []
 
     valid_bars = []
-
     for i, timestamp in enumerate(timestamps):
+        close = closes[i] if i < len(closes) else None
+        high = highs[i] if i < len(highs) else None
+        low = lows[i] if i < len(lows) else None
 
-        close = (
-            closes[i]
-            if i < len(closes)
-            else None
-        )
+        try:
+            close_float = float(close)
+        except (TypeError, ValueError):
+            continue
+        if timestamp is None or not math.isfinite(close_float):
+            continue
 
-        high = (
-            highs[i]
-            if i < len(highs)
-            else None
-        )
+        try:
+            high_float = float(high) if high is not None and math.isfinite(float(high)) else None
+        except (TypeError, ValueError):
+            high_float = None
+        try:
+            low_float = float(low) if low is not None and math.isfinite(float(low)) else None
+        except (TypeError, ValueError):
+            low_float = None
 
-        low = (
-            lows[i]
-            if i < len(lows)
-            else None
-        )
-
-        if (
-            timestamp is not None
-            and close is not None
-            and math.isfinite(float(close))
-        ):
-            valid_bars.append({
-                "timestamp": int(timestamp),
-                "close": float(close),
-                "high": (
-                    float(high)
-                    if high is not None
-                    and math.isfinite(float(high))
-                    else None
-                ),
-                "low": (
-                    float(low)
-                    if low is not None
-                    and math.isfinite(float(low))
-                    else None
-                ),
-            })
+        valid_bars.append({
+            "timestamp": int(timestamp),
+            "close": close_float,
+            "high": high_float,
+            "low": low_float,
+        })
 
     price = meta.get("regularMarketPrice")
     timestamp = meta.get("regularMarketTime")
-
-    if price is not None:
-        price = float(price)
-
-        if not math.isfinite(price):
+    try:
+        price = float(price) if price is not None else None
+        if price is not None and not math.isfinite(price):
             price = None
+    except (TypeError, ValueError):
+        price = None
 
     if price is None:
         if not valid_bars:
-            raise RuntimeError(
-                f"{symbol} için geçerli fiyat yok."
-            )
-
+            raise RuntimeError(f"{symbol} için geçerli fiyat yok.")
         price = valid_bars[-1]["close"]
         timestamp = valid_bars[-1]["timestamp"]
 
     if timestamp is None or int(timestamp) <= 0:
         if not valid_bars:
-            raise RuntimeError(
-                f"{symbol} için fiyat zaman damgası yok."
-            )
-
+            raise RuntimeError(f"{symbol} için fiyat zaman damgası yok.")
         timestamp = valid_bars[-1]["timestamp"]
 
-    observed_at = datetime.fromtimestamp(
-        int(timestamp),
-        tz=timezone.utc,
-    ).astimezone(TIMEZONE)
-
+    observed_at = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone(TIMEZONE)
     recent_bars = valid_bars[-5:]
-
-    recent_highs = [
-        bar["high"]
-        for bar in recent_bars
-        if bar["high"] is not None
-    ]
-
-    recent_lows = [
-        bar["low"]
-        for bar in recent_bars
-        if bar["low"] is not None
-    ]
-
-    high_5d = (
-        max(recent_highs)
-        if recent_highs
-        else None
-    )
-
-    low_5d = (
-        min(recent_lows)
-        if recent_lows
-        else None
-    )
+    recent_highs = [bar["high"] for bar in recent_bars if bar["high"] is not None]
+    recent_lows = [bar["low"] for bar in recent_bars if bar["low"] is not None]
 
     return {
         "name": name,
@@ -699,52 +539,28 @@ def piyasa_verisini_getir(
         "price": price,
         "observed_at": observed_at,
         "retrieved_at": istanbul_saati(),
-        "high_5d": high_5d,
-        "low_5d": low_5d,
+        "high_5d": max(recent_highs) if recent_highs else None,
+        "low_5d": min(recent_lows) if recent_lows else None,
         "source": "Yahoo Finance",
-        "source_url": (
-            "https://finance.yahoo.com/quote/"
-            + quote(symbol, safe="")
-            + "/"
-        ),
+        "source_url": "https://finance.yahoo.com/quote/" + quote(symbol, safe="") + "/",
     }
 
 
 def piyasa_verilerini_getir():
-
     data = []
-
-    for asset in MARKET_ASSETS:
-
-        name, symbol, unit, decimals = asset
-
+    for name, symbol, unit, decimals in MARKET_ASSETS:
         try:
-
-            item = piyasa_verisini_getir(
-                name,
-                symbol,
-                unit,
-                decimals,
-            )
-
+            item = piyasa_verisini_getir(name, symbol, unit, decimals)
             logging.info(
-                "PİYASA VERİSİ | %s | Fiyat: %s | "
-                "Veri zamanı: %s | Alınma zamanı: %s",
+                "PİYASA VERİSİ | %s | Fiyat: %s | Veri zamanı: %s | Alınma: %s",
                 name,
                 item["price"],
                 item["observed_at"].isoformat(),
                 item["retrieved_at"].isoformat(),
             )
-
             data.append(item)
-
         except Exception as error:
-
-            logging.exception(
-                "%s fiyatı alınamadı.",
-                symbol,
-            )
-
+            logging.exception("%s fiyatı alınamadı.", symbol)
             data.append({
                 "name": name,
                 "symbol": symbol,
@@ -756,26 +572,10 @@ def piyasa_verilerini_getir():
                 "high_5d": None,
                 "low_5d": None,
                 "source": "Yahoo Finance",
-                "source_url": (
-                    "https://finance.yahoo.com/quote/"
-                    + quote(symbol, safe="")
-                    + "/"
-                ),
+                "source_url": "https://finance.yahoo.com/quote/" + quote(symbol, safe="") + "/",
                 "error": str(error),
             })
-
-    available = [
-        item
-        for item in data
-        if item["price"] is not None
-    ]
-
-    if not available:
-        raise RuntimeError(
-            "Hiçbir piyasa fiyatı alınamadı. "
-            "Bülten oluşturulmayacak."
-        )
-
+    # Hiç fiyat alınamasa bile hata raporu e-postayla gidebilsin.
     return data
 
 
@@ -784,462 +584,112 @@ def piyasa_verilerini_getir():
 # ============================================================
 
 def piyasa_html_tablosu(veriler):
-
     rows = []
-
     for item in veriler:
-
         if item["price"] is None:
-
             price_text = "VERİ ALINAMADI"
             time_text = "Doğrulanamadı"
             range_text = "—"
-
         else:
-
-            price_text = fiyat_formatla(
-                item["price"],
-                item["decimals"],
-            )
-
-            time_text = tarih_formatla(
-                item["observed_at"]
-            )
-
-            if (
-                item["high_5d"] is not None
-                and item["low_5d"] is not None
-            ):
-
+            price_text = fiyat_formatla(item["price"], item["decimals"])
+            time_text = tarih_formatla(item["observed_at"])
+            if item["high_5d"] is not None and item["low_5d"] is not None:
                 range_text = (
-                    fiyat_formatla(
-                        item["low_5d"],
-                        item["decimals"],
-                    )
+                    fiyat_formatla(item["low_5d"], item["decimals"])
                     + " – "
-                    + fiyat_formatla(
-                        item["high_5d"],
-                        item["decimals"],
-                    )
+                    + fiyat_formatla(item["high_5d"], item["decimals"])
                 )
-
             else:
                 range_text = "—"
 
         source_link = (
-            '<a href="'
-            + html.escape(
-                item["source_url"],
-                quote=True,
-            )
-            + '">Kaynak</a>'
+            '<a href="' + html.escape(item["source_url"], quote=True) + '">Kaynak</a>'
         )
-
         rows.append(
             "<tr>"
-            f"<td>{html.escape(item['name'])}</td>"
-            f"<td style='text-align:right;font-weight:bold'>"
-            f"{html.escape(price_text)}</td>"
-            f"<td>{html.escape(item['unit'])}</td>"
-            f"<td>{html.escape(time_text)}</td>"
-            f"<td>{html.escape(range_text)}</td>"
-            f"<td>{source_link}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb'>{html.escape(item['name'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:bold'>{html.escape(price_text)}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb'>{html.escape(item['unit'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb'>{html.escape(time_text)}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb'>{html.escape(range_text)}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #e5e7eb'>{source_link}</td>"
             "</tr>"
         )
 
-    retrieved_at = tarih_formatla(
-        istanbul_saati()
-    )
-
+    retrieved_at = tarih_formatla(istanbul_saati())
     return f"""
-    <section style="
-        margin:24px 0;
-        font-family:Arial,sans-serif;
-        color:#202124;
-    ">
-
-      <h2 style="font-size:21px">
-        Piyasa Fiyatları — Doğrudan Veri Kaynağı
-      </h2>
-
-      <p style="font-size:12px;color:#666">
-        Veri sorgulama zamanı: {html.escape(retrieved_at)}.
-        Her fiyatın yanında sağlayıcının bildirdiği son
-        veri zamanı yer alır. Sorgulama zamanı ile fiyatın
-        veri zamanı aynı olmak zorunda değildir.
-      </p>
-
-      <div style="overflow-x:auto">
-      <table style="
-          width:100%;
-          border-collapse:collapse;
-          font-size:12px;
-      ">
-        <thead>
-          <tr style="background:#eef1f5">
-            <th style="padding:9px;text-align:left">Varlık</th>
-            <th style="padding:9px;text-align:right">Fiyat</th>
-            <th style="padding:9px;text-align:left">Birim</th>
-            <th style="padding:9px;text-align:left">
-              Son veri zamanı
-            </th>
-            <th style="padding:9px;text-align:left">
-              Son 5 günlük mum aralığı
-            </th>
-            <th style="padding:9px;text-align:left">Kaynak</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows)}
-        </tbody>
-      </table>
-      </div>
-
-      <p style="font-size:11px;color:#777">
-        Kaynak: Yahoo Finance. Fiyatlar gecikmeli olabilir.
-        Beş günlük yüksek/düşük değerleri otomatik olarak
-        kesin destek veya direnç seviyesi anlamına gelmez.
-      </p>
-
+    <section style="margin:24px 0;font-family:Arial,sans-serif;color:#202124;">
+      <h2 style="font-size:21px;margin-bottom:8px">Piyasa Fiyatları — Doğrudan Veri Kaynağı</h2>
+      <p style="font-size:12px;color:#666">Veri sorgulama zamanı: {html.escape(retrieved_at)}. Her fiyatın yanında sağlayıcının bildirdiği son veri zamanı yer alır.</p>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead><tr style="background:#eef1f5">
+          <th style="padding:9px;text-align:left">Varlık</th>
+          <th style="padding:9px;text-align:right">Fiyat</th>
+          <th style="padding:9px;text-align:left">Birim</th>
+          <th style="padding:9px;text-align:left">Son veri zamanı</th>
+          <th style="padding:9px;text-align:left">Son 5 günlük mum aralığı</th>
+          <th style="padding:9px;text-align:left">Kaynak</th>
+        </tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table></div>
+      <p style="font-size:11px;color:#777">Kaynak: Yahoo Finance. Fiyatlar gecikmeli olabilir. Vadeli işlem fiyatları spot fiyatlarla aynı olmak zorunda değildir. Beş günlük yüksek/düşük değerleri kesin destek veya direnç seviyesi değildir.</p>
     </section>
     """
 
 
+def fiyat_tablosunu_html_e_pkle(html_content, piyasa_verileri):
+    table = piyasa_html_tablosu(piyasa_verileri)
+    match = re.search(r"<body\b[^>]*>", html_content, flags=re.IGNORECASE)
+    if not match:
+        html_content = html_sayfa(html_content)
+        match = re.search(r"<body\b[^>]*>", html_content, flags=re.IGNORECASE)
+    if not match:
+        raise RuntimeError("HTML gövdesi bulunamadı; fiyat tablosu eklenemedi.")
+    return html_content[:match.end()] + table + html_content[match.end():]
+
+
 # ============================================================
-# 5. GEMINI İLE GÜNLÜK FİNANS BÜLTENİ OLUŞTUR
+# 5. GEMINI BAŞARISIZ OLURSA GÖNDERİLECEK YEDEK BÜLTEN
 # ============================================================
 
-def gemini_ile_guncel_bulten_uret(
-    analizler,
-    piyasa_verileri,
-):
+def yedek_bulten_uret(videolar, hata):
+    now_text = istanbul_saati().strftime("%d.%m.%Y %H:%M:%S (TSİ)")
+    durum = html.escape(gemini_hata_mesaji(hata))
 
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-    now = istanbul_saati()
-
-    # Python tarafından alınmış doğrudan piyasa verileri.
-    market_text_lines = []
-
-    for item in piyasa_verileri:
-
-        if item["price"] is None:
-
-            market_text_lines.append(
-                f"{item['name']}: VERİ ALINAMADI."
+    if videolar:
+        video_rows = []
+        for index, video in enumerate(videolar, start=1):
+            video_rows.append(
+                "<li style='margin:8px 0'>"
+                f"<strong>{html.escape(video['channel'])}</strong> — "
+                f"<a href='{html.escape(video['url'], quote=True)}'>"
+                f"{html.escape(video['title'])}</a> "
+                f"<span style='color:#666;font-size:12px'>({html.escape(video['published_at'] or 'Tarih bilinmiyor')})</span>"
+                "</li>"
             )
-
-            continue
-
-        low = (
-            fiyat_formatla(
-                item["low_5d"],
-                item["decimals"],
-            )
-            if item["low_5d"] is not None
-            else "Yok"
-        )
-
-        high = (
-            fiyat_formatla(
-                item["high_5d"],
-                item["decimals"],
-            )
-            if item["high_5d"] is not None
-            else "Yok"
-        )
-
-        market_text_lines.append(
-            f"{item['name']}: "
-            f"{fiyat_formatla(item['price'], item['decimals'])} "
-            f"{item['unit']}; "
-            f"son veri zamanı: "
-            f"{tarih_formatla(item['observed_at'])}; "
-            f"son 5 günlük mum düşük/yüksek: "
-            f"{low}/{high}; "
-            f"kaynak: {item['source_url']}"
-        )
-
-    market_text = "\n".join(
-        market_text_lines
-    )
-
-    # Dokuz videonun ayrı ayrı oluşturulmuş analizlerini
-    # son sentez için bir araya getir.
-    video_sections = []
-
-    for index, item in enumerate(
-        analizler,
-        start=1,
-    ):
-
-        video_sections.append(
-            f"""
-VİDEO {index}
-Kanal: {item['channel']}
-Başlık: {item['title']}
-Yayın tarihi: {item['published_at']}
-URL: {item['url']}
-
-ANALİZ:
-{item['analysis']}
-"""
-        )
-
-    all_video_analyses = "\n\n".join(
-        video_sections
-    )
-
-    prompt = f"""
-Sen deneyimli bir finansal araştırma analisti ve
-HTML e-posta tasarımcısısın.
-
-RAPOR TARİHİ:
-{now.strftime('%d.%m.%Y %H:%M:%S')} Türkiye saati.
-
-==================================================
-A. GÜNCEL PİYASA VERİLERİ
-==================================================
-
-Bu fiyatlar Python tarafından doğrudan veri kaynağından
-alındı. Fiyat tablosu HTML e-postasına ayrıca eklenecek.
-
-{market_text}
-
-ZORUNLU KURALLAR:
-
-1. Bu fiyat tablosundaki sayısal fiyatlar tek doğrulanmış
-   fiyat girdisidir. Başka bir fiyatı "anlık fiyat" olarak
-   sunma ve yeni fiyat rakamları uydurma.
-
-2. Veri zamanı eskiyse bunu gizleme. Son kapanış veya
-   gecikmeli veri ile anlık fiyatı birbirinden ayır.
-
-3. Kaynağı belirtilmeyen piyasa fiyatını doğrulanmış
-   güncel fiyat olarak yazma.
-
-4. Son 5 günlük mumların en düşük ve en yüksek değerleri
-   kesin destek/direnç seviyeleri değildir. Bunları yalnızca
-   referans aralığı olarak kullan.
-
-==================================================
-B. YOUTUBE ANALİZLERİ
-==================================================
-
-Aşağıda üç kanalın son üç videosunun ayrı ayrı analizleri var.
-Bu analizler dışında kalan görüşleri konuşmacılara atfetme.
-
-{all_video_analyses}
-
-==================================================
-C. RAPOR İÇERİĞİ
-==================================================
-
-1. STRATEJİ NOTU
-
-En başta iki cümlelik ortak strateji notu yaz.
-Kanalların gerçekten ortaklaştığı piyasa temalarını,
-konsensüs yönünü ve ana belirsizlikleri belirt.
-
-Görüşler farklıysa yapay bir konsensüs oluşturma.
-
-2. EMTİALAR
-
-Altın, gümüş ve Brent petrol için:
-- 🟢 veya 🔴 yön rozeti.
-- Kısa vadeli teknik görünüm.
-- Videolarda gerçekten belirtilmişse ilgili destek,
-  direnç veya hedef seviyesi ve hangi videoda geçtiği.
-- Temel gerekçe ve önemli katalizör.
-
-Veri yetersizse kesin yön veya fiyat seviyesi uydurma.
-Sağlanan fiyat tablosundaki rakamlarla çelişme.
-
-3. MAJÖR PİYASALAR
-
-BIST 100, Nasdaq Composite, Bitcoin, USD/TRY ve
-EUR/TRY için:
-- Yön rozeti.
-- Teknik görünüm ve ilgili katalizörler.
-- Destek veya direnç seviyeleri yalnızca analizlerde
-  veya gerçek fiyat verilerinde dayanak varsa belirtilsin.
-- Hedefin doğrudan video görüşü mü, yoksa analitik
-  çıkarım mı olduğu açıklansın.
-
-Döviz çiftlerindeki yükselişin TL açısından anlamını
-doğru yorumla. Örneğin USD/TRY artışı TL'nin dolar
-karşısında değer kaybetmesi demektir.
-
-4. GÜNDEM VE MAKRO
-
-Google Search kullanarak rapor tarihine en yakın güvenilir
-kaynaklardan TCMB, faiz, enflasyon, fon/SPK ve jeopolitik
-gelişmeleri araştır.
-
-En önemli 2-3 konuyu seç. Her gelişmenin tarihi, kaynağı
-ve olası piyasa etkisi bulunsun.
-
-Gelecek tarihli veya doğrulanamayan bir haberi olmuş
-gibi sunma.
-
-5. UZMAN SENTEZİ
-
-Üç kanalın analizlerini karşılaştır:
-- Ortak görüşler.
-- Ayrışan görüşler.
-- Kısa ve orta vadeli beklenti farklılıkları.
-- Görüşlerin hangi koşullarda geçerli olduğu.
-
-Her görüşü mümkün olduğunda ilgili videoya bağla.
-Bir konuşmacının söylemediği rakamı veya görüşü ona
-atfetme.
-
-6. RİSKLER VE TAKİP LİSTESİ
-
-Gün içinde izlenmesi gereken önemli ekonomik gelişmeleri,
-veri açıklamalarını veya piyasa koşullarını belirt.
-Doğrulanmamış bir olay saati veya ekonomik veri takvimi
-üretme.
-
-7. KAYNAKLAR
-
-Güncel makro haberlerin ve analizde kullanılan
-dış kaynakların bağlantılarını HTML içinde göster.
-
-==================================================
-D. TASARIM
-==================================================
-
-Yalnızca tam HTML dokümanı üret.
-Markdown veya ```html kod bloğu kullanma.
-
-- Türkçe dilinde, okunabilir bir HTML e-posta hazırla.
-- CSS stillerini mümkün olduğunca inline kullan.
-- Mobil uyumlu, sade kartlar ve renkli yön rozetleri kullan.
-- Üretim tarihini ve saatini en üstte göster.
-- Kaynak bağlantılarını görünür metinlerle sun.
-- JavaScript, dış CSS veya uzak görsel kullanma.
-- Python'ın ayrıca ekleyeceği doğrudan fiyat tablosunu
-  yeniden oluşturma.
-- Fiyat tablosunu tekrar etme ve farklı fiyat tablosu üretme.
-- Finansal gerçeklerle analitik yorumları birbirinden ayır.
-- Son bölümde bunun yatırım tavsiyesi olmadığını belirt.
-
-Yanıtın ilk karakteri HTML dokümanına ait olmalı.
-Yanıtın içinde açıklama veya Markdown kod çiti bulunmamalı.
-"""
-
-    logging.info(
-        "Gemini güncel bülten sentezini hazırlıyor."
-    )
-
-    interaction = client.interactions.create(
-        model=GEMINI_MODEL,
-        input=prompt,
-        tools=[
-            {
-                "type": "google_search"
-            }
-        ],
-        background=True,
-    )
-
-    interaction = interaction_sonucunu_bekle(
-        client,
-        interaction,
-        timeout_seconds=1800,
-    )
-
-    html_code = getattr(
-        interaction,
-        "output_text",
-        None,
-    )
-
-    if not html_code or not html_code.strip():
-        raise RuntimeError(
-            "Gemini boş bülten döndürdü."
-        )
-
-    html_code = html_code.strip()
-
-    # Markdown kod çitlerini temizle.
-    html_code = re.sub(
-        r"^\s*```(?:html)?\s*",
-        "",
-        html_code,
-        flags=re.IGNORECASE,
-    )
-
-    html_code = re.sub(
-        r"\s*```\s*$",
-        "",
-        html_code,
-    ).strip()
-
-    if "<html" not in html_code.lower():
-        html_code = (
-            "<!DOCTYPE html>"
-            "<html lang='tr'>"
-            "<head>"
-            "<meta charset='UTF-8'>"
-            "<meta name='viewport' "
-            "content='width=device-width, initial-scale=1.0'>"
-            "<title>Günlük Finans ve Piyasa Bülteni</title>"
-            "</head>"
-            "<body>"
-            + html_code
-            + "</body></html>"
-        )
-
-    if "<body" not in html_code.lower():
-        html_code = re.sub(
-            r"</head\s*>",
-            "</head><body>",
-            html_code,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-
-        if "<body" not in html_code.lower():
-            html_code = (
-                "<html><body>"
-                + html_code
-                + "</body></html>"
-            )
-
-    if len(html_code) < 500:
-        raise RuntimeError(
-            "Bülten beklenenden kısa. E-posta gönderilmeyecek."
-        )
-
-    # Fiyat tablosunu Python'ın ürettiği güvenilir
-    # verilerden oluştur ve gövdenin başına ekle.
-    table = piyasa_html_tablosu(
-        piyasa_verileri
-    )
-
-    html_code, replacements = re.subn(
-        r"(<body\b[^>]*>)",
-        lambda match: match.group(1) + table,
-        html_code,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-
-    if replacements != 1:
-        raise RuntimeError(
-            "Doğrudan fiyat tablosu HTML'e eklenemedi."
-        )
-
-    logging.info(
-        "HTML bülten hazır. Karakter sayısı: %s",
-        len(html_code),
-    )
-
-    return html_code
+        video_html = "<ol>" + "".join(video_rows) + "</ol>"
+    else:
+        video_html = "<p>Bu çalıştırmada YouTube video listesi alınamadı.</p>"
+
+    body = f"""
+    <main style="max-width:900px;margin:0 auto;padding:16px;font-family:Arial,sans-serif;color:#202124;line-height:1.55">
+      <header style="border-bottom:3px solid #263b59;padding-bottom:12px">
+        <h1 style="margin-bottom:4px">Günlük Finans ve Piyasa Bülteni</h1>
+        <p style="color:#666;margin-top:0">Oluşturulma zamanı: {html.escape(now_text)}</p>
+      </header>
+      <section style="background:#fff7e6;border-left:4px solid #d97706;padding:14px;margin:18px 0">
+        <h2 style="margin-top:0;font-size:18px">Kısmi rapor — otomatik analiz tamamlanamadı</h2>
+        <p>{durum}</p>
+        <p>Bu e-posta eksikliği gizlememek için kısmi rapor olarak gönderilmiştir. Aşağıdaki fiyatlar doğrudan veri kaynağından alınabilen verilerdir; video ve güncel haber analizleri oluşturulmamıştır.</p>
+      </section>
+      <h2>Son bulunan YouTube videoları</h2>
+      {video_html}
+      <p style="font-size:12px;color:#666">Video bağlantılarının listelenmesi videoların analiz edildiği anlamına gelmez.</p>
+      <hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
+      <p style="font-size:12px;color:#666">Bu içerik yatırım tavsiyesi değildir. Piyasa fiyatları gecikmeli olabilir ve yatırım kararı için tek başına kullanılmamalıdır.</p>
+    </main>
+    """
+    return html_sayfa(body)
 
 
 # ============================================================
@@ -1247,112 +697,39 @@ Yanıtın içinde açıklama veya Markdown kod çiti bulunmamalı.
 # ============================================================
 
 def html_to_plain_text(html_content):
-
     text = re.sub(
-        r"<(script|style)\b[^>]*>.*?</\1>",
-        " ",
-        html_content,
+        r"<(script|style)\b[^>]*>.*?</\1>", " ", html_content,
         flags=re.IGNORECASE | re.DOTALL,
     )
-
     text = re.sub(
-        r"<br\s*/?>|</p>|</div>|</tr>|</h[1-6]>",
-        "\n",
-        text,
+        r"<br\s*/?>|</p>|</div>|</tr>|</h[1-6]>", "\n", text,
         flags=re.IGNORECASE,
     )
-
-    text = re.sub(
-        r"<[^>]+>",
-        " ",
-        text,
-    )
-
+    text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
-
-    text = re.sub(
-        r"[ \t]+",
-        " ",
-        text,
-    )
-
-    text = re.sub(
-        r"\n\s*\n+",
-        "\n\n",
-        text,
-    )
-
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
 
 
 def eposta_gonder(html_icerik):
-
     if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-        raise RuntimeError(
-            "GMAIL_USER veya GMAIL_PASS bulunamadı."
-        )
+        raise RuntimeError("GMAIL_USER veya GMAIL_PASS bulunamadı.")
 
     msg = MIMEMultipart("alternative")
-
-    subject = (
-        "Günlük Finans & Piyasa Bülteni — "
-        + istanbul_saati().strftime("%d.%m.%Y")
-    )
-
-    msg["Subject"] = Header(
-        subject,
-        "utf-8",
-    )
-
+    subject = "Günlük Finans & Piyasa Bülteni — " + istanbul_saati().strftime("%d.%m.%Y")
+    msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = TO_EMAIL
 
-    plain_text = html_to_plain_text(
-        html_icerik
-    )
+    msg.attach(MIMEText(html_to_plain_text(html_icerik), "plain", "utf-8"))
+    msg.attach(MIMEText(html_icerik, "html", "utf-8"))
 
-    msg.attach(
-        MIMEText(
-            plain_text,
-            "plain",
-            "utf-8",
-        )
-    )
-
-    msg.attach(
-        MIMEText(
-            html_icerik,
-            "html",
-            "utf-8",
-        )
-    )
-
-    logging.info(
-        "E-posta gönderiliyor: %s",
-        TO_EMAIL,
-    )
-
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465,
-        timeout=40,
-    ) as server:
-
-        server.login(
-            EMAIL_ADDRESS,
-            EMAIL_PASSWORD,
-        )
-
-        server.sendmail(
-            EMAIL_ADDRESS,
-            [TO_EMAIL],
-            msg.as_string(),
-        )
-
-    logging.info(
-        "Bülten başarıyla gönderildi: %s",
-        TO_EMAIL,
-    )
+    logging.info("E-posta gönderiliyor: %s", TO_EMAIL)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=40) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, [TO_EMAIL], msg.as_string())
+    logging.info("Bülten başarıyla gönderildi: %s", TO_EMAIL)
 
 
 # ============================================================
@@ -1360,63 +737,56 @@ def eposta_gonder(html_icerik):
 # ============================================================
 
 def main():
-
-    logging.info(
-        "Günlük bülten başladı: %s",
-        istanbul_saati().isoformat(),
-    )
-
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY bulunamadı."
-        )
-
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError(
-            "YOUTUBE_API_KEY bulunamadı."
-        )
+    logging.info("Günlük bülten başladı: %s", istanbul_saati().isoformat())
 
     if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-        raise RuntimeError(
-            "Gmail kimlik bilgileri eksik."
-        )
+        raise RuntimeError("GMAIL_USER veya GMAIL_PASS bulunamadı; e-posta gönderilemez.")
 
-    # Önce en yeni videoları bul.
-    videolar = son_videolari_getir()
+    # YouTube erişimi başarısız olsa bile fiyat tablosu ve durum raporu gönderilir.
+    try:
+        videolar = son_videolari_getir()
+    except Exception as error:
+        logging.exception("YouTube videoları alınamadı; kısmi bülten hazırlanacak.")
+        videolar = []
+        youtube_hatasi = error
+    else:
+        youtube_hatasi = None
 
-    # Her videoyu ayrı ayrı analiz et.
-    analizler = videolari_analiz_et(
-        videolar
-    )
+    try:
+        piyasa_verileri = piyasa_verilerini_getir()
+    except Exception:
+        # Normalde fonksiyon her varlığın hatasını ayrı kaydeder; bu blok
+        # beklenmeyen genel bir hataya karşı son güvenlik katmanıdır.
+        logging.exception("Piyasa verileri alınırken beklenmeyen hata oluştu.")
+        piyasa_verileri = [
+            {
+                "name": name, "symbol": symbol, "unit": unit,
+                "decimals": decimals, "price": None, "observed_at": None,
+                "retrieved_at": istanbul_saati(), "high_5d": None,
+                "low_5d": None, "source": "Yahoo Finance",
+                "source_url": "https://finance.yahoo.com/quote/" + quote(symbol, safe="") + "/",
+            }
+            for name, symbol, unit, decimals in MARKET_ASSETS
+        ]
 
-    # Fiyatları analizlerin ardından al ki bülten
-    # oluşturulmadan önce mümkün olduğunca yeni olsun.
-    piyasa_verileri = piyasa_verilerini_getir()
+    try:
+        if youtube_hatasi:
+            raise RuntimeError(f"YouTube API erişimi başarısız: {youtube_hatasi}")
+        html_bulten = gemini_ile_guncel_bulten_uret(videolar, piyasa_verileri)
+    except Exception as error:
+        logging.exception("Tam bülten oluşturulamadı; kısmi rapor hazırlanacak.")
+        html_bulten = yedek_bulten_uret(videolar, error)
 
-    # Güncel fiyatlar ve video analizleriyle HTML hazırla.
-    html_bulten = gemini_ile_guncel_bulten_uret(
-        analizler,
-        piyasa_verileri,
-    )
+    html_bulten = html_belgesini_duzenle(html_bulten)
+    html_bulten = fiyat_tablosunu_html_e_pkle(html_bulten, piyasa_verileri)
+    eposta_gonder(html_bulten)
 
-    # Hatalı/boş analizde buraya gelinmez.
-    eposta_gonder(
-        html_bulten
-    )
-
-    logging.info(
-        "Tüm işlemler tamamlandı: %s",
-        istanbul_saati().isoformat(),
-    )
+    logging.info("Tüm işlemler tamamlandı: %s", istanbul_saati().isoformat())
 
 
 if __name__ == "__main__":
-
     try:
         main()
-
     except Exception:
-        logging.exception(
-            "BÜLTEN OLUŞTURULAMADI VEYA GÖNDERİLEMEDİ."
-        )
+        logging.exception("BÜLTEN OLUŞTURULAMADI VEYA GÖNDERİLEMEDİ.")
         raise
