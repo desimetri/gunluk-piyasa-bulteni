@@ -4,7 +4,7 @@ on:
   schedule:
     # Her gün UTC saatiyle 05:00'te çalışır (Türkiye saatiyle sabah 08:00)
     - cron: '0 5 * * *'
-  workflow_dispatch: # İsterseniz butona basarak da manuel çalıştırabilirsiniz
+  workflow_dispatch: # İsterseniz Actions sekmesinden manuel tetikleyebilirsiniz
 
 jobs:
   build:
@@ -21,11 +21,12 @@ jobs:
 
     - name: Gerekli Kütüphaneleri Yükle
       run: |
-        pip install feedparser requests
+        pip install feedparser requests google-generativeai
 
     - name: Bülten Kodunu Çalıştır
       env:
         GMAIL_USER: ${{ secrets.GMAIL_USER }}
         GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         python main.py
