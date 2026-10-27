@@ -315,95 +315,6 @@ def interaction_sonucunu_bekle(
     return interaction
 
 
-def video_analiz_et(client, video, index):
-
-    logging.info(
-        "Video analizi başlıyor (%s/9): %s",
-        index,
-        video["title"],
-    )
-
-    prompt = f"""
-Aşağıdaki YouTube videosunu doğrudan video girdisi
-olarak incele. Sadece video başlığına, açıklamasına veya
-konuşmacının genel görüşlerine dayanarak içerik uydurma.
-
-KANAL: {video['channel']}
-VİDEO BAŞLIĞI: {video['title']}
-YAYIN TARİHİ: {video['published_at']}
-VİDEO URL: {video['url']}
-
-Türkçe olarak şu başlıklarda analiz hazırla:
-
-1. Konuşmacının ana piyasa görüşü ve analiz ufku.
-2. Altın, gümüş, petrol, BIST, Nasdaq, Bitcoin ve
-   döviz hakkındaki somut değerlendirmeleri.
-3. Videoda gerçekten belirtilen fiyat seviyeleri,
-   destekler, dirençler ve hedefler.
-4. Temel gerekçeler, ekonomik gelişmeler ve katalizörler.
-5. Konuşmacının yükseliş veya düşüş beklentisinin
-   hangi koşullara bağlı olduğu.
-6. Görüşün kısa vadeli mi, orta vadeli mi olduğu.
-
-ÖNEMLİ KURALLAR:
-
-- Videoda gerçekten söylenmeyen fiyat seviyelerini üretme.
-- Videoda bulunmayan bir görüşü konuşmacıya atfetme.
-- Videoya erişemez veya içeriğini analiz edemezsen bunu
-  açıkça "VİDEO ANALİZ EDİLEMEDİ" diye belirt.
-- Başlıktan hareketle videoyu izlemiş gibi davranma.
-- Konuşmacının kendi söylediği rakamlarla senin
-  yorumlarını birbirinden ayır.
-- Mümkünse önemli ifadelerin zaman damgalarını ekle.
-- Yalnızca bu videoyu analiz et.
-"""
-
-    interaction = client.interactions.create(
-        model=GEMINI_MODEL,
-        input=[
-            {
-                "type": "text",
-                "text": prompt,
-            },
-            {
-                "type": "video",
-                "uri": video["url"],
-            },
-        ],
-        background=True,
-    )
-
-    interaction = interaction_sonucunu_bekle(
-        client,
-        interaction,
-        timeout_seconds=1800,
-    )
-
-    analysis = getattr(
-        interaction,
-        "output_text",
-        None,
-    )
-
-    if not analysis or not analysis.strip():
-        raise RuntimeError(
-            f"Gemini boş analiz döndürdü: {video['url']}"
-        )
-
-    if "VİDEO ANALİZ EDİLEMEDİ" in analysis.upper():
-        raise RuntimeError(
-            "Video içeriği analiz edilemedi. "
-            "Eksik video analiziyle bülten gönderilmeyecek: "
-            + video["url"]
-        )
-
-    logging.info(
-        "Video analizi tamamlandı (%s/9).",
-        index,
-    )
-
-    return analysis.strip()
-
 
 def videolari_analiz_et(videolar):
     client = genai.Client(
@@ -411,14 +322,185 @@ def videolari_analiz_et(videolar):
     )
 
     analizler = []
+    max_deneme = 3
 
     for index, video in enumerate(videolar, start=1):
-
-        analiz = video_analiz_et(
-            client,
-            video,
+        logging.info(
+            "Video uygunluğu kontrol ediliyor (%s/%s): %s",
             index,
+            len(videolar),
+            video["title"],
         )
+
+        uygunluk_prompt = f"""
+Aşağıdaki YouTube videosunu yalnızca konu uygunluğu açısından
+sınıflandır.
+
+KANAL: {video['channel']}
+BAŞLIK: {video['title']}
+YAYIN TARİHİ: {video['published_at']}
+URL: {video['url']}
+
+Bu bültenin amacı finansal piyasalar ve ekonomi analizidir.
+
+ANALİZE UYGUN:
+- Finansal piyasalar, yatırım, borsa, BIST, Nasdaq
+- Altın, gümüş, petrol, döviz, Bitcoin ve diğer finansal varlıklar
+- Merkez bankaları, faiz, enflasyon, makroekonomi
+- Ekonomik gelişmeler, şirket bilançoları ve piyasa haberleri
+- Finansal piyasaları etkileyebilecek jeopolitik gelişmeler
+
+ANALİZ DIŞI BIRAK:
+- Sponsorlu ürün tanıtımları ve reklam videoları
+- Telefon, teknoloji, otomobil veya başka ürün incelemeleri
+- Ürün kutu açılışı, alışveriş ve kişisel vlog içerikleri
+- Ekonomi veya finansal piyasalarla ilgisi olmayan içerikler
+- Yalnızca ürün tanıtımı içeren işbirliği videoları
+
+Önemli:
+- Sadece başlığa bakarak kesin karar veremiyorsan ve içerik
+  belirsizse uygunluk durumunu UNCERTAIN olarak belirt.
+- Finansal piyasalar veya ekonomiyle anlamlı ilgisi olmayan
+  videoyu analiz dışı bırak.
+- Videonun içeriğini izlemiş gibi davranma.
+- Sadece aşağıdaki üç sonuçtan birini yaz:
+  ANALYZE
+  IGNORE
+  UNCERTAIN
+- Ardından tek satırlık kısa gerekçe yaz.
+"""
+
+        uygunluk = None
+        uygunluk_hatasi = None
+
+        for deneme in range(1, max_deneme + 1):
+            try:
+                yanit = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=uygunluk_prompt,
+                )
+
+                uygunluk = (yanit.text or "").strip()
+                if uygunluk:
+                    uygunluk_hatasi = None
+                    break
+
+                raise RuntimeError(
+                    "Gemini uygunluk kontrolünde boş yanıt döndürdü."
+                )
+
+            except Exception as e:
+                uygunluk_hatasi = e
+                logging.warning(
+                    "Uygunluk kontrolü başarısız (%s/%s), "
+                    "video=%s, hata=%s",
+                    deneme,
+                    max_deneme,
+                    video["title"],
+                    e,
+                )
+
+                if deneme < max_deneme:
+                    time.sleep(10 * (2 ** (deneme - 1)))
+
+        if uygunluk_hatasi is not None or not uygunluk:
+            # Sınıflandırma yapılamıyorsa yanlış içerik üretme;
+            # videoyu analiz dışı bırakıp sebebini kaydet.
+            analizler.append({
+                "channel": video["channel"],
+                "title": video["title"],
+                "published_at": video["published_at"],
+                "url": video["url"],
+                "analysis": (
+                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
+                    "Konu uygunluğu belirlenemedi."
+                ),
+            })
+            logging.error(
+                "Uygunluk kontrolü tamamlanamadı; video atlandı: %s",
+                video["title"],
+            )
+            continue
+
+        karar = uygunluk.splitlines()[0].strip().upper()
+
+        if karar == "IGNORE":
+            logging.info(
+                "Video analiz dışı bırakıldı: %s | %s",
+                video["title"],
+                uygunluk,
+            )
+
+            analizler.append({
+                "channel": video["channel"],
+                "title": video["title"],
+                "published_at": video["published_at"],
+                "url": video["url"],
+                "analysis": (
+                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
+                    + uygunluk,
+                ),
+            })
+            # Tuple değil metin saklamak için alanı düzelt.
+            analizler[-1]["analysis"] = (
+                "VİDEO ANALİZ DIŞI BIRAKILDI: " + uygunluk
+            )
+            continue
+
+        if karar != "ANALYZE":
+            # Belirsiz içerikleri finansal analiz diye sunma.
+            logging.info(
+                "Video konusu belirsiz; analiz dışı bırakıldı: %s",
+                video["title"],
+            )
+            analizler.append({
+                "channel": video["channel"],
+                "title": video["title"],
+                "published_at": video["published_at"],
+                "url": video["url"],
+                "analysis": (
+                    "VİDEO ANALİZ DIŞI BIRAKILDI: "
+                    "Ekonomi/piyasa ilgisi doğrulanamadı."
+                ),
+            })
+            continue
+
+        analiz = None
+        son_hata = None
+
+        for deneme in range(1, max_deneme + 1):
+            try:
+                analiz = video_analiz_et(
+                    client,
+                    video,
+                    index,
+                )
+                son_hata = None
+                break
+
+            except Exception as e:
+                son_hata = e
+                logging.exception(
+                    "Video analizi başarısız (%s/%s), "
+                    "video=%s",
+                    deneme,
+                    max_deneme,
+                    video["title"],
+                )
+
+                if deneme < max_deneme:
+                    time.sleep(10 * (2 ** (deneme - 1)))
+
+        if son_hata is not None or not analiz:
+            analiz = (
+                "VİDEO ANALİZ EDİLEMEDİ: "
+                f"Son hata: {son_hata}"
+            )
+            logging.error(
+                "Video tüm denemelerde başarısız; diğer videolara "
+                "geçiliyor: %s",
+                video["title"],
+            )
 
         analizler.append({
             "channel": video["channel"],
@@ -428,10 +510,31 @@ def videolari_analiz_et(videolar):
             "analysis": analiz,
         })
 
-    if len(analizler) != 9:
-        raise RuntimeError(
-            "Dokuz videonun tamamı analiz edilemedi."
+    basarili = sum(
+        1 for item in analizler
+        if not item["analysis"].startswith(
+            ("VİDEO ANALİZ EDİLEMEDİ", "VİDEO ANALİZ DIŞI BIRAKILDI")
         )
+    )
+
+    atlanan = sum(
+        1 for item in analizler
+        if item["analysis"].startswith("VİDEO ANALİZ DIŞI BIRAKILDI")
+    )
+
+    basarisiz = sum(
+        1 for item in analizler
+        if item["analysis"].startswith("VİDEO ANALİZ EDİLEMEDİ")
+    )
+
+    logging.info(
+        "Video işlemleri tamamlandı. Analiz: %s, dışı bırakılan: %s, "
+        "başarısız: %s, toplam: %s",
+        basarili,
+        atlanan,
+        basarisiz,
+        len(analizler),
+    )
 
     return analizler
 
