@@ -1,32 +1,38 @@
+
 name: Günlük Finans Bülteni Otomasyonu
 
 on:
   schedule:
-    # Her gün Türkiye saatiyle sabah 08:00'de (UTC 05:00) çalışır
-    - cron: '0 5 * * *'
-  workflow_dispatch: # Manuel test için butonu aktif tutar
+    # Her gün Türkiye saatiyle 08:00 (UTC 05:00)
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Depoyu Kopyala (Checkout)
-      uses: actions/checkout@v3
+      - name: Depoyu Kopyala
+        uses: actions/checkout@v4
 
-    - name: Python Ortamını Kur
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Gerekli Kütüphaneleri Yükle
-      run: |
-        pip install google-generativeai
+      - name: Gerekli Kütüphaneleri Yükle
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-    - name: Bülten Kodunu Çalıştır
-      env:
-        GMAIL_USER: ${{ secrets.GMAIL_USER }}
-        GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      run: |
-        python main.py
+      - name: Bülten Kodunu Çalıştır
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          python -u main.py
