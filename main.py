@@ -7,36 +7,38 @@ from email.mime.text import MIMEText
 # Ortam Değişkenleri (GitHub Secrets üzerinden alınır)
 EMAIL_ADDRESS = os.environ.get("GMAIL_USER")
 EMAIL_PASSWORD = os.environ.get("GMAIL_PASS")
-GEMINI_API_KEY = os.environ.get("GMAIL_PASS") # Yedek kontrol
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TO_EMAIL = "muratuslu@gmail.com"
 
 def gemini_ile_guncel_bulten_uret():
-    """Gemini'nin kendi güncel bilgi tabanını ve finansal analiz yeteneğini kullanarak bülten üretir."""
     genai.configure(api_key=GEMINI_API_KEY)
     
-    # En kararlı çalışan Gemini modelini kullanıyoruz
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Google Search aracı (grounding) etkinleştirildi
+    model = genai.GenerativeModel(
+        model_name='gemini-1.5-flash',
+        tools='google_search'
+    )
 
     prompt = """
-    Sen profesyonel bir finans analistisin. @EMRAHLAFCI, @barissoydan ve @KanalFinans YouTube kanallarının son dönemdeki analiz yaklaşımlarını, piyasa trendlerini ve güncel finansal verileri baz alarak kapsamlı bir Günlük Finans & Piyasa Bülteni hazirla.
+    Bugünün tarihini baz alarak küresel piyasalardaki ve Türkiye'deki en güncel finansal verileri (Altın, Gümüş, Brent Petrol, BIST 100, Nasdaq, Bitcoin, Döviz kuru vb.) internetten arayıp bularak Günlük Finans & Piyasa Bülteni hazirla.
+    @EMRAHLAFCI, @barissoydan ve @KanalFinans kanallarının son günlerdeki analiz yaklaşımlarını ve ana gündemlerini sentezle.
 
-    Aşağıdaki kurallara ve formata KESİNLİKLE uy:
+    Aşağıdaki kurallara KESİNLİKLE uy:
     1. **Strateji Notu:** En başta 2 cümlelik ortak Strateji Notu (konsensüs yönü ve ana tema) yaz.
-    2. **Emtialar (Altın, Gümüş, Petrol):** Her biri için yön rozeti (🔴 veya 🟢), güncel seviye, kritik stop/destek ve 1-2 cümlelik net gerekçe belirt.
+    2. **Emtialar (Altın, Gümüş, Petrol):** Her biri için yön rozeti (🔴 veya 🟢), anlık/güncel net fiyat seviyesi, kritik stop/destek ve 1-2 cümlelik net gerekçe belirt.
     3. **Majör Piyasalar (BIST 100, Nasdaq, Bitcoin, Döviz):** Her biri için yön rozeti (🔴 veya 🟢), teknik hedef/destek ve hareketin arka planındaki temel katalizörü yaz.
     4. **Gündem & Makro (TCMB, Fon/SPK gelişmeleri, jeopolitik):** 2-3 maddelik odaklı ve doyurucu mikro-analiz ekle.
     5. **Uzman Sentezi:** Bültenin sonuna kanallardaki görüşlerin ayrıştığı ve birleştiği noktaları vurgulayan geniş bir özet sentez paragrafı ekle.
     
     Tasarım Kuralları:
-    - Renkli badge'lere (etiketlere), temiz kenarlıklı kartlara ve dengeli metin açıklamalarına sahip modern, taranabilir bir HTML e-posta şablonu oluştur.
-    - Sadece ham (raw) HTML kodu döndür, ```html gibi markdown blokları kullanma.
+    - Renkli badge'lere, temiz kenarlıklı kartlara ve dengeli metin açıklamalarına sahip modern, taranabilir bir HTML e-posta şablonu oluştur.
+    - Sadece ham (raw) HTML kodu döndür, ```html gibi markdown blokları kesinlikle kullanma.
     """
 
     response = model.generate_content(prompt)
     html_kod = response.text
     
-    # Eğer model yanlışlıkla markdown blok eklediyse temizleyelim
+    # Markdown blokları temizleme emniyeti
     html_kod = html_kod.replace("```html", "").replace("```", "").strip()
     return html_kod
 
