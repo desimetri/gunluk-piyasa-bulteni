@@ -2,9 +2,9 @@ name: Günlük Finans Bülteni Otomasyonu
 
 on:
   schedule:
-    # Her gün UTC saatiyle 05:00'te çalışır (Türkiye saatiyle sabah 08:00)
+    # Her gün Türkiye saatiyle sabah 08:00'de (UTC 05:00) çalışır
     - cron: '0 5 * * *'
-  workflow_dispatch: # İsterseniz Actions sekmesinden manuel tetikleyebilirsiniz
+  workflow_dispatch: # Manuel test için butonu aktif tutar
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
 
     - name: Gerekli Kütüphaneleri Yükle
       run: |
-        pip install feedparser requests google-generativeai
+        pip install google-generativeai
 
     - name: Bülten Kodunu Çalıştır
       env:
