@@ -251,6 +251,7 @@ def son_videolari_getir():
 # 2. HER YOUTUBE VİDEOSUNU GEMINI İLE AYRI AYRI ANALİZ ET
 # ============================================================
 
+
 def interaction_sonucunu_bekle(
     client,
     interaction,
@@ -278,8 +279,37 @@ def interaction_sonucunu_bekle(
     ).lower()
 
     if status in ("failed", "cancelled", "incomplete"):
+        # API'nin döndürdüğü hata ayrıntılarını bulmaya çalış.
+        hata = getattr(interaction, "error", None)
+        eksik_bilgi = getattr(
+            interaction, "incomplete_details", None
+        )
+
+        # SDK nesnesinin tüm yanıtını da inceleme için kaydet.
+        try:
+            if hasattr(interaction, "model_dump"):
+                ayrinti = interaction.model_dump(
+                    exclude_none=True
+                )
+            else:
+                ayrinti = repr(interaction)
+        except Exception as e:
+            ayrinti = f"Yanıt ayrıntıları okunamadı: {e!r}"
+
+        logging.error("Gemini işlem durumu: %s", status)
+        logging.error("Gemini hata alanı: %r", hata)
+        logging.error(
+            "Gemini eksik işlem ayrıntıları: %r",
+            eksik_bilgi,
+        )
+        logging.error(
+            "Gemini API yanıt ayrıntıları: %r",
+            ayrinti,
+        )
+
         raise RuntimeError(
-            f"Gemini işlemi tamamlanamadı. Durum: {status}"
+            f"Gemini işlemi tamamlanamadı. Durum: {status}. "
+            f"Hata: {hata!r}. Ayrıntılar GitHub Actions logunda."
         )
 
     return interaction
